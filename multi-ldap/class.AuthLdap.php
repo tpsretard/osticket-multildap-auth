@@ -356,7 +356,7 @@ class AuthLdap {
         $info = @ldap_get_entries( $this->connection, $this->result);
 
         // Only one entry should be returned(no groups will have the same name)
-        $entry = ldap_first_entry( $this->connection,$this->result);
+        $entry = @ldap_first_entry( $this->connection,$this->result);
 
         if ( !$entry) {
             $this->ldapErrorCode = ldap_errno( $this->connection);

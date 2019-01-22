@@ -65,7 +65,7 @@ class LdapMultiAuthPlugin extends Plugin {
 		$this->crontime = $this->millisecsBetween($schedule, $lastrun, false) / 1000 / 60;
 		
 		$this->sync_cron($this->crontime);
-			include_once (INCLUDE_DIR . 'scp/sync_mldap.php');
+			include_once (INCLUDE_DIR . '../scp/sync_mldap.php');
 			$sync = new SyncLDAPMultiClass($this->id);
 			//$this->logger('warning', 'Sync Config', $sync->config);
 
@@ -575,90 +575,113 @@ class LDAPMultiAuthentication {
 
 	function authOrCreate($username) {
 		global $cfg;
-		switch ($this->type) {
-			case 'staff':
-				if (($user = StaffSession::lookup($username)) && $user->getId()) {
-					if (!$user instanceof StaffSession) {
-						// osTicket <= v1.9.7 or so
-						$user = new StaffSession($user->getId());
-					}
-					return $user;
-				}
-				else {
-					$staff_groups = preg_split('/;|,/', $this->config->get('multiauth-staff-group'));
-					$chkgroup;
-					foreach ($staff_groups as $staff_group) {
-						if ($ldap->checkGroup($name, $staff_group)) {
-							$chkgroup = true;
-							break;
-						}
-					}
-					
-					if ($config->get('multiauth-staff-register') && $chkgroup) {
-						if (!($info = $this->search($username, false))) {
-							return;
-						}
-						$errors = array();
-						$staff = array();
-						$staff['username'] = $info['username'];
-						$staff['firstname'] = $info['first'];
-						$staff['lastname'] = $info['last'];
-						$staff['email'] = $info['email'];
-						$staff['isadmin'] = 0;
-						$staff['isactive'] = 1;
-						$staff['group_id'] = 1;
-						$staff['dept_id'] = 1;
-						$staff['welcome_email'] = "on";
-						$staff['timezone_id'] = 8;
-						$staff['isvisible'] = 1;
-						Staff::create($staff, $errors);
+		$config = $this->getConfig();
+		
+		$info = $this->ldapinfo();
+		$ldap = new AuthLdap();
+		foreach ($info as $data) {
+			$ldap->serverType = 'ActiveDirectory';
+			$ldap->server = preg_split('/;|,/', $data['servers']);
+			$ldap->domain = $data['sd'];
+			$ldap->dn = $data['dn'];
+		
+			try {
+				switch ($this->type) {
+					case 'staff':
 						if (($user = StaffSession::lookup($username)) && $user->getId()) {
 							if (!$user instanceof StaffSession) {
+								// osTicket <= v1.9.7 or so
 								$user = new StaffSession($user->getId());
 							}
 							return $user;
 						}
+						else {
+							$staff_groups = preg_split('/;|,/', $this->config->get('multiauth-staff-group'));
+							$chkgroup = true;
+							
+							foreach ($staff_groups as $staff_group) {
+								if ($ldap->checkGroup($username, $staff_group)) {
+									$chkgroup = true;
+									break;
+								}
+							}
+							
+							if ($config->get('multiauth-staff-register') && $chkgroup) {
+								if (!($info = $this->search($username, false))) {
+									return;
+								}
+								$errors = array();
+								$staff = array();
+								$staff['username'] = $info['username'];
+								$staff['firstname'] = $info['first'];
+								$staff['lastname'] = $info['last'];
+								$staff['email'] = $info['email'];
+								$staff['isadmin'] = 0;
+								$staff['isactive'] = 1;
+								$staff['dept_id'] = $cfg->getDefaultDeptId();
+								$staff['role_id'] = 1;
+								$staff['timezone'] = $cfg->getDefaultTimezone();
+								$staff['isvisible'] = 1;
+								$staff['backend'] = StaffLDAPMultiAuthentication::$id;
+								
+								$staffRegister = Staff::create($staff, $errors);
+								
+								if ($staffRegister->save()) {
+									$staffRegister->sendResetEmail('registration-staff', false);
+									if (($user = StaffSession::lookup($username)) && $user->getId()) {
+										if (!$user instanceof StaffSession) {
+											$user = new StaffSession($user->getId());
+										}
+										return $user;
+									}
+								}
+
+							}
+						}
+					break;
+					case 'client':
+						// Lookup all the information on the user. Try to get the email
+						// addresss as well as the username when looking up the user
+						// locally.
+
+						if (!($info = $this->search($username))) {
+							LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap info (' . $username . ')', json_encode($info));
+						return;
+						}
+						
+						$acct = ClientAccount::lookupByUsername($username);
+
+						if ($acct && $acct->getId()) {
+							$client = new ClientSession(new EndUser($acct->getUser()));
+							//LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap acct (' . $username . ')', json_encode($acct));
+							LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap session (' . $username . ')', json_encode($client));
+						}
+						
+						if (!$client) {
+
+							$info['name'] = $info['first'] . " " . $info['last'];
+							$info['email'] = $info['email'];
+							$info['full'] = $info['full'];
+							$info['first'] = $info['first'];
+							$info['last'] = $info['last'];
+							$info['username'] = $info['username'];
+							$info['dn'] = $info['dn'];
+
+							$client = new ClientCreateRequest($this, $username, $info);
+							LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap client (' . $username . ')', json_encode($info));
+							//if (!$cfg || !$cfg->isClientRegistrationEnabled() && self::$config->get('multiauth-force-register')) {
+							// return $client->attemptAutoRegister();
+							//}
+							
+						}
+						return $client;
 					}
-				}
-			break;
-			case 'client':
-				// Lookup all the information on the user. Try to get the email
-				// addresss as well as the username when looking up the user
-				// locally.
-
-				if (!($info = $this->search($username))) {
-					LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap info (' . $username . ')', json_encode($info));
-				return;
-				}
-				
-				$acct = ClientAccount::lookupByUsername($username);
-
-				if ($acct && $acct->getId()) {
-					$client = new ClientSession(new EndUser($acct->getUser()));
-					//LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap acct (' . $username . ')', json_encode($acct));
-					LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap session (' . $username . ')', json_encode($client));
-				}
-				
-				if (!$client) {
-
-					$info['name'] = $info['first'] . " " . $info['last'];
-					$info['email'] = $info['email'];
-					$info['full'] = $info['full'];
-					$info['first'] = $info['first'];
-					$info['last'] = $info['last'];
-					$info['username'] = $info['username'];
-					$info['dn'] = $info['dn'];
-
-					$client = new ClientCreateRequest($this, $username, $info);
-					LdapMultiAuthPlugin::logger(LOG_INFO, 'ldap client (' . $username . ')', json_encode($info));
-					//if (!$cfg || !$cfg->isClientRegistrationEnabled() && self::$config->get('multiauth-force-register')) {
-					// return $client->attemptAutoRegister();
-					//}
-					
-				}
-				return $client;
+				return null;
+			} catch(Exception $e) {
+				//Debug log the errors
+				LdapMultiAuthPlugin::logger(LOG_DEBUG, 'Connection error (' . $username . ')', $e->getMessage());
 			}
-			return null;
+		}		
 	}
 
 	function convert_user($ldap, $username) {
